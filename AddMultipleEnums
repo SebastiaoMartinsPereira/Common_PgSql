@@ -1,0 +1,147 @@
+-- Dica recuperada no link http://en.dklab.ru/lib/dklab_postgresql_enum/
+-- Melhorias foram realizadas com a adição da verificação se o valor a ser inserido já existe
+-- evitando o ERROR: enum label "EXEMPLO" already exists SQL state: 42710
+--
+
+--View que lista todos os enums da base de dados.
+CREATE OR REPLACE VIEW vw_enums AS
+SELECT t.typname, e.enumlabel, e.enumsortorder,nspname
+FROM pg_enum e
+JOIN pg_type t ON e.enumtypid = t.oid
+JOIN pg_namespace ON pg_namespace.oid= t.typnamespace;
+
+
+
+--Schema para as funções que tratam de enums
+CREATE SCHEMA IF NOT EXISTS enum AUTHORIZATION postgres;
+
+SET search_path = enum, pg_catalog;
+SET check_function_bodies = false;
+
+--Funcão para adicionar enums 
+CREATE OR REPLACE FUNCTION enum.enum_add (
+  enum_name varchar,
+  enum_elem varchar
+)
+RETURNS void AS
+$body$
+DECLARE
+    eoid OID;
+    has_sortorder BOOLEAN;
+BEGIN
+    eoid := (  
+        SELECT pg_type.oid
+        FROM pg_type JOIN pg_namespace ON pg_namespace.oid=pg_type.typnamespace
+        WHERE typtype='e' AND enum_name IN(typname, nspname||'.'||typname)
+    );
+    
+    has_sortorder := EXISTS(
+        select 1
+        from pg_attribute
+        where attrelid=(select oid from pg_class where relname='pg_enum') and attname='enumsortorder'
+    );
+ 
+
+   IF(  
+      EXISTS(select * from vw_enums  where enum_name IN(typname, nspname||'.'||typname) and enumlabel = enum_elem )
+     ) THEN
+           RAISE NOTICE '%',E'Enum label : '|| enum_elem ||' já exite para tipo ' || enum_name ;
+           RETURN;
+   END IF; 
+    
+    IF has_sortorder THEN
+        EXECUTE '
+            INSERT INTO pg_enum(enumtypid, enumlabel, enumsortorder) VALUES(
+                '||eoid||',
+                '||quote_literal(enum_elem)||',
+                (SELECT MAX(enumsortorder) + 1 FROM pg_enum WHERE enumtypid='||eoid||')
+            )
+        ';
+    ELSE
+        EXECUTE E'INSERT INTO pg_enum(enumtypid, enumlabel) VALUES('||eoid||', '||quote_literal(enum_elem)||')';
+    END IF;
+
+     RAISE NOTICE '%',E'Enum label : '|| enum_elem ||' incluso com sucesso.';
+END;
+$body$
+    LANGUAGE 'plpgsql';
+
+
+--Função para remover enums
+CREATE OR REPLACE FUNCTION enum.enum_del (enum_name character varying, enum_elem character varying) RETURNS void
+AS 
+$body$
+DECLARE
+    type_oid INTEGER;
+    rec RECORD;
+    sql VARCHAR;
+    ret INTEGER;
+BEGIN
+    SELECT pg_type.oid
+    FROM pg_type 
+    WHERE typtype = 'e' AND typname = enum_name
+    INTO type_oid;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Cannot find a enum: %', enum_name; 
+    END IF;
+                             
+    -- Check column DEFAULT value references.
+    SELECT *
+    FROM 
+        pg_attrdef
+        JOIN pg_attribute ON attnum = adnum AND atttypid = type_oid
+        JOIN pg_class ON pg_class.oid = attrelid
+        JOIN pg_namespace ON pg_namespace.oid = relnamespace
+    WHERE   
+        adsrc = quote_literal(enum_elem) || '::' || quote_ident(enum_name)
+    LIMIT 1
+    INTO rec; 
+    
+    IF FOUND THEN
+        RAISE EXCEPTION 
+            'Cannot delete the ENUM element %.%: column %.%.% has DEFAULT value of ''%''',
+            quote_ident(enum_name), quote_ident(enum_elem),
+            quote_ident(rec.nspname), quote_ident(rec.relname),
+            rec.attname, quote_ident(enum_elem);
+    END IF;
+    
+    -- Check data references.
+    FOR rec IN 
+        SELECT *
+        FROM 
+            pg_attribute
+            JOIN pg_class ON pg_class.oid = attrelid
+            JOIN pg_namespace ON pg_namespace.oid = relnamespace
+        WHERE 
+            atttypid = type_oid
+            AND relkind = 'r'
+    LOOP
+        sql := 
+            'SELECT 1 FROM ONLY ' 
+            || quote_ident(rec.nspname) || '.'
+            || quote_ident(rec.relname) || ' '
+            || ' WHERE ' 
+            || quote_ident(rec.attname) || ' = '
+            || quote_literal(enum_elem)
+            || ' LIMIT 1';
+        EXECUTE sql INTO ret;
+        IF ret IS NOT NULL THEN
+            RAISE EXCEPTION 
+                'Cannot delete the ENUM element %.%: column %.%.% contains references',
+                quote_ident(enum_name), quote_ident(enum_elem),
+                quote_ident(rec.nspname), quote_ident(rec.relname),
+                rec.attname;
+        END IF;
+    END LOOP;    
+    
+    -- OK. We may delete.
+    DELETE FROM pg_enum WHERE enumtypid = type_oid AND enumlabel = enum_elem;
+END;
+$body$
+    LANGUAGE plpgsql;
+
+
+COMMENT ON FUNCTION enum.enum_add (enum_name character varying, enum_elem character varying) IS 'Inserts a new ENUM element wthout re-creating the whole type.';
+COMMENT ON FUNCTION enum.enum_del (enum_name character varying, enum_elem character varying) IS 'Removes the ENUM element "on the fly". Check references to the ENUM element in database''s tables before the deletion and throws an exception if the element cannot be deleted.';
+
